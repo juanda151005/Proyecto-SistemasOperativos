@@ -1,0 +1,23 @@
+# Área de almacenamiento temporal (se crea en tiempo de ejecución)
+/tmp/aralmac/
+aralmac/
+
+# FIFOs temporales (se crean en tiempo de ejecución)
+/tmp/ejlotes_*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+.claude/
+*.swp
+*~
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

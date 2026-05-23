@@ -2,1043 +2,348 @@
 
 **Autor:** Juan David Velásquez Restrepo  
 **Fecha:** Mayo 2026  
-**Curso:** Sistemas Operativos  
+**Curso:** Sistemas Operativos — ST0257  
+**Implementación:** Python 3 / Linux
 
 ---
 
 ## 1. Descripción General
 
-El sistema simula un ejecutor de lotes inspirado en los sistemas operativos de mainframe. Permite registrar programas y ficheros, y ejecutar procesos de lotes que leen de entrada estándar, procesan datos y retornan resultados por salida estándar.
+El sistema simula un ejecutor de procesos de lotes inspirado en los sistemas operativos de mainframe. Permite registrar programas y ficheros en un área de almacenamiento persistente (aralmac), y luego lanzar procesos de lotes que leen de su entrada estándar, procesan datos y retornan resultados por salida estándar.
 
 ### 1.1 Componentes
 
-| Componente | Rol |
-|---|---|
-| **cliente** | Interfaz de usuario. Envía peticiones CRUD de programas/ficheros y gestión de procesos de lotes. |
-| **ctrllt** | Pasarela central. Recibe peticiones del cliente y las enruta al servicio correspondiente. |
-| **gesfich** | Gestión de ficheros. CRUD sobre ficheros almacenados en `aralmac`. |
-| **gesprog** | Gestión de programas. CRUD sobre programas almacenados en `aralmac`. |
-| **ejecutor** | Ejecución de procesos de lotes. Crea, supervisa y gestiona procesos hijo. |
-| **aralmac** | Área de almacenamiento persistente (directorio en disco). |
+| Componente | Archivo | Rol |
+|---|---|---|
+| **ctrllt** | `src/ctrllt.py` | Pasarela central. Enruta peticiones del cliente a los servicios internos. |
+| **gesfich** | `src/gesfich.py` | Gestor de ficheros. CRUD sobre archivos en aralmac. |
+| **gesprog** | `src/gesprog.py` | Gestor de programas. CRUD sobre metadatos de ejecutables en aralmac. |
+| **ejecutor** | `src/ejecutor.py` | Ejecutor de procesos de lotes. Lanza, monitorea y gestiona procesos hijo. |
+| **aralmac** | directorio en disco | Área de almacenamiento persistente (directorio configurable con `-x`). |
+| **cliente** | proporcionado por el profesor | Interfaz de usuario. Envía peticiones a ctrllt. |
 
 ### 1.2 Diagrama de Arquitectura
 
 ```
-                     ┌──────────┐
-                     │ cliente 1 │──┐
-                     └──────────┘  │
-                     ┌──────────┐  │    ┌────────┐    ┌─────────┐
-                     │ cliente 2 │──┼───▶│ ctrllt │───▶│ gesprog │──┐
-                     └──────────┘  │    │        │    └─────────┘  │
-                     ┌──────────┐  │    │        │    ┌─────────┐  │  ┌─────────┐
-                     │ cliente N │──┘    │        │───▶│ gesfich │──┼─▶│ aralmac │
-                     └──────────┘       │        │    └─────────┘  │  └─────────┘
-                                        │        │    ┌──────────┐ │
-                                        │        │───▶│ ejecutor │─┘
-                                        └────────┘    └──────────┘
+                          ┌──────────┐
+          cliente 1 ─────▶│          │
+          cliente 2 ─────▶│  ctrllt  │────▶ gesfich ──▶ aralmac/ficheros/
+          cliente N ─────▶│          │────▶ gesprog ──▶ aralmac/programas/
+                          │          │────▶ ejecutor ──▶ aralmac/ (lee ambos)
+                          └──────────┘
 ```
+
+Los clientes solo hablan con ctrllt. Los servicios internos nunca se comunican directamente entre sí.
 
 ---
 
-## 2. Comunicación entre Procesos
+## 2. Comunicación entre Procesos (IPC)
 
-### 2.1 Mecanismo: Tuberías Nombradas (Named Pipes / FIFOs)
+### 2.1 Mecanismo: Tuberías Nombradas (FIFOs)
 
-La comunicación entre todos los componentes se realiza mediante tuberías nombradas.
+La comunicación entre todos los componentes se realiza mediante **tuberías nombradas** (FIFOs, creadas con `os.mkfifo()` en Python / `mkfifo` en bash).
 
-#### Linux (Half-Duplex)
+#### Por qué FIFOs y no sockets o pipes anónimas
 
-En Linux, las tuberías nombradas (FIFOs) son **half-duplex** (unidireccionales). Por lo tanto, cada conexión entre dos procesos requiere **dos tuberías**:
+Los FIFOs tienen nombre en el sistema de archivos, lo que permite que procesos independientes (lanzados en terminales separadas, sin relación padre-hijo) se conecten entre sí. Las pipes anónimas solo funcionan entre procesos relacionados por `fork()`. Los sockets serían más complejos para este caso.
 
-- Una tubería para enviar peticiones (request).
-- Una tubería para recibir respuestas (response).
+#### Linux: Half-Duplex (dos FIFOs por conexión)
 
-**Creación:**
-```bash
-mkfifo /tmp/ejlotes_ctrllt_req    # cliente → ctrllt (peticiones)
-mkfifo /tmp/ejlotes_ctrllt_res    # ctrllt → cliente (respuestas)
+En Linux, los FIFOs son **unidireccionales**. Cada conexión entre dos procesos requiere dos FIFOs:
+
+```
+proceso A ──[pipe_req]──▶ proceso B   (A envía peticiones a B)
+proceso A ◀──[pipe_res]── proceso B   (B envía respuestas a A)
 ```
 
-**API en C (Linux):**
-```c
-#include <sys/stat.h>
-#include <fcntl.h>
+#### Estrategia de apertura: O_RDWR para evitar interbloqueo
 
-// Crear FIFO
-mkfifo("/tmp/ejlotes_ctrllt_req", 0666);
+Si el servicio A abre su FIFO con `O_RDONLY`, se bloquea hasta que alguien la abra con `O_WRONLY`. Si ambos procesos esperan que el otro abra primero, hay interbloqueo (deadlock). La solución es abrir con `O_RDWR`:
 
-// Abrir para escritura (emisor)
-int fd_write = open("/tmp/ejlotes_ctrllt_req", O_WRONLY);
-
-// Abrir para lectura (receptor)
-int fd_read = open("/tmp/ejlotes_ctrllt_req", O_RDONLY);
+```python
+fd = os.open(ruta_fifo, os.O_RDWR)
 ```
 
-#### Windows 11 (Full-Duplex)
+Con `O_RDWR`, el kernel considera que la pipe tiene al menos un lector y un escritor (el mismo proceso), por lo que no bloquea. Esto permite que los servicios arranquen en cualquier orden sin coordinación.
 
-En Windows, las tuberías nombradas son **full-duplex** (bidireccionales). Solo se necesita **una tubería** por conexión.
-
-**API en C (Windows):**
-```c
-#include <windows.h>
-
-// Servidor: crear tubería
-HANDLE hPipe = CreateNamedPipe(
-    "\\\\.\\pipe\\ejlotes_ctrllt",
-    PIPE_ACCESS_DUPLEX,
-    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-    PIPE_UNLIMITED_INSTANCES,
-    4096, 4096, 0, NULL
-);
-
-// Cliente: conectar a tubería
-HANDLE hPipe = CreateFile(
-    "\\\\.\\pipe\\ejlotes_ctrllt",
-    GENERIC_READ | GENERIC_WRITE,
-    0, NULL, OPEN_EXISTING, 0, NULL
-);
-```
+**Tradeoff**: con `O_RDWR`, el proceso no recibe EOF cuando el escritor cierra la pipe. Para este sistema, el ciclo de vida se controla con la operación `"Terminar"`, no con el cierre físico de la pipe.
 
 ### 2.2 Convención de Nombres de Tuberías
 
-| Conexión | Linux (req / res) | Windows |
+| Conexión | Pipe de peticiones | Pipe de respuestas |
 |---|---|---|
-| cliente ↔ ctrllt | `/tmp/ejlotes_cli_req`, `/tmp/ejlotes_cli_res` | `\\.\pipe\ejlotes_cli` |
-| ctrllt ↔ gesfich | `/tmp/ejlotes_fich_req`, `/tmp/ejlotes_fich_res` | `\\.\pipe\ejlotes_fich` |
-| ctrllt ↔ gesprog | `/tmp/ejlotes_prog_req`, `/tmp/ejlotes_prog_res` | `\\.\pipe\ejlotes_prog` |
-| ctrllt ↔ ejecutor | `/tmp/ejlotes_ejec_req`, `/tmp/ejlotes_ejec_res` | `\\.\pipe\ejlotes_ejec` |
+| cliente ↔ ctrllt | `/tmp/ejlotes_cli_req` | `/tmp/ejlotes_cli_res` |
+| ctrllt ↔ gesfich | `/tmp/ejlotes_fich_req` | `/tmp/ejlotes_fich_res` |
+| ctrllt ↔ gesprog | `/tmp/ejlotes_prog_req` | `/tmp/ejlotes_prog_res` |
+| ctrllt ↔ ejecutor | `/tmp/ejlotes_ejec_req` | `/tmp/ejlotes_ejec_res` |
 
-> **Nota:** Cuando hay múltiples clientes, cada cliente genera un par de tuberías únicas usando un sufijo (PID o UUID), por ejemplo: `/tmp/ejlotes_cli_12345_req`.
+Estos nombres son configurables a través de los argumentos de línea de comandos.
 
-### 2.3 Protocolo de Mensajes
+### 2.3 Lectura de Mensajes: Byte a Byte
 
-Cada mensaje se transmite como una cadena JSON terminada en un delimitador `\n` (newline). Esto permite al receptor leer línea por línea y deserializar cada mensaje.
+Los mensajes se leen byte a byte hasta encontrar el delimitador `\n`:
 
-**Flujo de comunicación:**
-
+```python
+buffer = b""
+while True:
+    byte = os.read(fd, 1)
+    if byte == b"\n":
+        break
+    buffer += byte
+return json.loads(buffer.decode("utf-8"))
 ```
-Cliente ──[JSON request]──▶ ctrllt ──[JSON request]──▶ servicio
-Cliente ◀──[JSON response]── ctrllt ◀──[JSON response]── servicio
-```
+
+**Por qué byte a byte y no bloques grandes**: Un FIFO puede devolver menos bytes de los pedidos si el buffer interno está parcialmente lleno. Si se leen bloques de 4096 bytes, se podría obtener parte de un mensaje y parte del siguiente, rompiendo el parse JSON. Leyendo byte a byte se garantiza exactamente un mensaje por llamada.
+
+**Por qué esto es seguro (no hay mensajes partidos)**: El kernel de Linux garantiza que escrituras menores a `PIPE_BUF` (4096 bytes en Linux, igual a `MSG_MAX_LEN`) son **atómicas**: llegan completas o no llegan. Como cada mensaje JSON tiene máximo 4096 bytes, nunca llega "a la mitad".
 
 ---
 
-## 3. Formato de Mensajes JSON
+## 3. Protocolo de Mensajes JSON
 
-### 3.1 Estructura General de Petición (Request)
+### 3.1 Formato de Petición (cliente → ctrllt → servicio)
 
 ```json
-{
-  "id": "req-001",
-  "servicio": "gesfich | gesprog | ejecutor",
-  "operacion": "<nombre-operacion>",
-  "parametros": { }
-}
+{"servicio":"<svc>","operacion":"<op>"[, campos adicionales...]}
 ```
 
-| Campo | Tipo | Descripción |
+### 3.2 Formato de Respuesta (servicio → ctrllt → cliente)
+
+Éxito:
+```json
+{"estado":"ok"[, campos adicionales...]}
+```
+
+Error:
+```json
+{"estado":"error","mensaje":"<descripcion>"}
+```
+
+### 3.3 Identificadores
+
+| Tipo | Formato | Ejemplo |
 |---|---|---|
-| `id` | string | Identificador único de la petición (para correlacionar con la respuesta). |
-| `servicio` | string | Servicio destino: `"gesfich"`, `"gesprog"` o `"ejecutor"`. |
-| `operacion` | string | Nombre de la operación a ejecutar. |
-| `parametros` | object | Parámetros específicos de la operación. |
+| Fichero | `f-XXXX` | `f-0001` |
+| Programa | `p-XXXX` | `p-0001` |
+| Ejecución | `e-XXXX` | `e-0001` |
 
-### 3.2 Estructura General de Respuesta (Response)
+Los contadores se almacenan en archivos JSON en el aralmac y persisten entre reinicios del servicio.
 
-```json
-{
-  "id": "req-001",
-  "estado": "ok | error",
-  "datos": { },
-  "mensaje": ""
-}
-```
+### 3.4 Tamaño Máximo
 
-| Campo | Tipo | Descripción |
-|---|---|---|
-| `id` | string | Mismo identificador de la petición original. |
-| `estado` | string | `"ok"` si fue exitosa, `"error"` si falló. |
-| `datos` | object | Datos de respuesta (varía según operación). |
-| `mensaje` | string | Mensaje descriptivo (especialmente útil en errores). |
+`MSG_MAX_LEN = 4096 bytes` por mensaje (definido en el enunciado).
 
 ---
 
-## 4. Diseño por Componente
+## 4. Área de Almacenamiento (aralmac)
 
-### 4.1 ctrllt — Control de Lotes
-
-#### Responsabilidad
-Actúa como pasarela (gateway): recibe peticiones de los clientes, inspecciona el campo `servicio` del mensaje JSON y lo reenvía a la tubería del servicio correspondiente. Espera la respuesta del servicio y la reenvía al cliente.
-
-#### Máquina de Estados
-
-```
-  ┌────────┐         ┌───────────┐         ┌───────────┐
-  │ Inicio │────────▶│ Corriendo │────────▶│ Terminado │
-  └────────┘         └───────────┘         └───────────┘
-                      (Terminar)
-```
-
-- **Inicio → Corriendo:** Al arrancar, abre las tuberías y queda a la escucha.
-- **Corriendo → Terminado:** Recibe señal de terminación, cierra tuberías y finaliza.
-
-#### Lógica de Enrutamiento
-
-```
-recibir(peticion)
-├── peticion.servicio == "gesfich"  → enviar a tubería de gesfich
-├── peticion.servicio == "gesprog"  → enviar a tubería de gesprog
-├── peticion.servicio == "ejecutor" → enviar a tubería de ejecutor
-└── otro                            → responder error "servicio desconocido"
-```
-
-#### Concurrencia
-
-Para soportar múltiples clientes, `ctrllt` debe:
-
-- **Linux:** Usar `select()`, `poll()` o `epoll()` para multiplexar lecturas de múltiples tuberías, o crear un hilo (pthread) por cliente.
-- **Windows:** Usar `WaitForMultipleObjects()` o hilos (`CreateThread`) con instancias separadas de la tubería nombrada.
-
----
-
-### 4.2 gesfich — Gestión de Ficheros
-
-#### Responsabilidad
-CRUD de ficheros en el área de almacenamiento `aralmac`.
-
-#### Máquina de Estados
-
-```
-              Crear/Leer/Actualizar/Borrar
-                        ┌──────┐
-                        ▼      │
-  ┌────────┐    ┌───────────┐  │     ┌───────────┐
-  │ Inicio │───▶│ Corriendo │──┘  ┌─▶│ Terminado │
-  └────────┘    └───────────┘     │  └───────────┘
-                   │    ▲         │
-          Suspender│    │Reasumir │Terminar
-                   ▼    │         │
-                ┌────────────┐    │
-                │ Suspendido │────┘
-                └────────────┘
-```
-
-- **Suspendido:** No procesa peticiones CRUD. Solo acepta `Reasumir` y `Terminar`.
-
-#### Operaciones — Mensajes JSON
-
-**Crear fichero:**
-
-Petición:
-```json
-{
-  "id": "req-101",
-  "servicio": "gesfich",
-  "operacion": "crear",
-  "parametros": {}
-}
-```
-
-Respuesta exitosa:
-```json
-{
-  "id": "req-101",
-  "estado": "ok",
-  "datos": { "id_fichero": "f-0001" },
-  "mensaje": "Fichero creado exitosamente."
-}
-```
-
-**Leer fichero (por ID):**
-
-Petición:
-```json
-{
-  "id": "req-102",
-  "servicio": "gesfich",
-  "operacion": "leer",
-  "parametros": { "id_fichero": "f-0001" }
-}
-```
-
-Respuesta exitosa:
-```json
-{
-  "id": "req-102",
-  "estado": "ok",
-  "datos": {
-    "id_fichero": "f-0001",
-    "contenido": "contenido del fichero en base64 o texto plano"
-  },
-  "mensaje": ""
-}
-```
-
-**Leer todos los ficheros:**
-
-Petición:
-```json
-{
-  "id": "req-103",
-  "servicio": "gesfich",
-  "operacion": "leer",
-  "parametros": {}
-}
-```
-
-Respuesta exitosa:
-```json
-{
-  "id": "req-103",
-  "estado": "ok",
-  "datos": {
-    "ficheros": [
-      { "id_fichero": "f-0001", "tamaño": 1024 },
-      { "id_fichero": "f-0002", "tamaño": 512 }
-    ]
-  },
-  "mensaje": ""
-}
-```
-
-**Actualizar fichero:**
-
-Petición:
-```json
-{
-  "id": "req-104",
-  "servicio": "gesfich",
-  "operacion": "actualizar",
-  "parametros": {
-    "id_fichero": "f-0001",
-    "ruta_fichero": "/ruta/al/fichero/origen.txt"
-  }
-}
-```
-
-Respuesta exitosa:
-```json
-{
-  "id": "req-104",
-  "estado": "ok",
-  "datos": { "id_fichero": "f-0001" },
-  "mensaje": "Fichero actualizado exitosamente."
-}
-```
-
-**Borrar fichero:**
-
-Petición:
-```json
-{
-  "id": "req-105",
-  "servicio": "gesfich",
-  "operacion": "borrar",
-  "parametros": { "id_fichero": "f-0001" }
-}
-```
-
-Respuesta exitosa:
-```json
-{
-  "id": "req-105",
-  "estado": "ok",
-  "datos": {},
-  "mensaje": "Fichero borrado exitosamente."
-}
-```
-
-**Suspender / Reasumir / Terminar:**
-
-Petición (ejemplo Suspender):
-```json
-{
-  "id": "req-106",
-  "servicio": "gesfich",
-  "operacion": "suspender",
-  "parametros": {}
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-106",
-  "estado": "ok",
-  "datos": { "estado_servicio": "suspendido" },
-  "mensaje": "Servicio suspendido."
-}
-```
-
----
-
-### 4.3 gesprog — Gestión de Programas
-
-#### Responsabilidad
-CRUD de programas (ejecutables) en el área de almacenamiento `aralmac`.
-
-#### Máquina de Estados
-
-```
-              Guardar/Leer/Actualizar/Borrar
-                        ┌──────┐
-                        ▼      │
-  ┌────────┐    ┌───────────┐  │     ┌───────────┐
-  │ Inicio │───▶│ Corriendo │──┘  ┌─▶│ Terminado │
-  └────────┘    └───────────┘     │  └───────────┘
-                   │    ▲         │
-          Suspender│    │Reasumir │Terminar
-                   ▼    │         │
-                ┌────────────┐    │
-                │ Suspendido │────┘
-                └────────────┘
-```
-
-> **Nota:** En estado `Suspendido`, gesprog solo acepta operación `Leer` (además de `Reasumir` y `Terminar`), según la especificación.
-
-#### Operaciones — Mensajes JSON
-
-**Guardar programa:**
-
-Petición:
-```json
-{
-  "id": "req-201",
-  "servicio": "gesprog",
-  "operacion": "guardar",
-  "parametros": {
-    "ejecutable": "/usr/bin/sort",
-    "argumentos": ["-r", "-n"],
-    "ambiente": {
-      "LANG": "es_CO.UTF-8",
-      "PATH": "/usr/bin:/bin"
-    }
-  }
-}
-```
-
-Respuesta exitosa:
-```json
-{
-  "id": "req-201",
-  "estado": "ok",
-  "datos": { "id_programa": "p-0001" },
-  "mensaje": "Programa registrado exitosamente."
-}
-```
-
-**Leer programa (por ID):**
-
-Petición:
-```json
-{
-  "id": "req-202",
-  "servicio": "gesprog",
-  "operacion": "leer",
-  "parametros": { "id_programa": "p-0001" }
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-202",
-  "estado": "ok",
-  "datos": {
-    "id_programa": "p-0001",
-    "ejecutable": "/usr/bin/sort",
-    "argumentos": ["-r", "-n"],
-    "ambiente": { "LANG": "es_CO.UTF-8", "PATH": "/usr/bin:/bin" }
-  },
-  "mensaje": ""
-}
-```
-
-**Leer todos los programas:**
-
-Petición:
-```json
-{
-  "id": "req-203",
-  "servicio": "gesprog",
-  "operacion": "leer",
-  "parametros": {}
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-203",
-  "estado": "ok",
-  "datos": {
-    "programas": [
-      { "id_programa": "p-0001", "ejecutable": "/usr/bin/sort" },
-      { "id_programa": "p-0002", "ejecutable": "/usr/local/bin/miprog" }
-    ]
-  },
-  "mensaje": ""
-}
-```
-
-**Actualizar programa:**
-
-Petición:
-```json
-{
-  "id": "req-204",
-  "servicio": "gesprog",
-  "operacion": "actualizar",
-  "parametros": {
-    "id_programa": "p-0001",
-    "ejecutable": "/usr/bin/sort",
-    "argumentos": ["-r", "-n", "-k2"],
-    "ambiente": { "LANG": "en_US.UTF-8" }
-  }
-}
-```
-
-**Borrar programa:**
-
-Petición:
-```json
-{
-  "id": "req-205",
-  "servicio": "gesprog",
-  "operacion": "borrar",
-  "parametros": { "id_programa": "p-0001" }
-}
-```
-
----
-
-### 4.4 ejecutor — Ejecución de Procesos de Lotes
-
-#### Responsabilidad
-Ejecutar procesos de lotes combinando programas registrados en `gesprog` con ficheros registrados en `gesfich`. Gestionar su ciclo de vida.
-
-#### Máquina de Estados
-
-```
-  ┌────────┐    ┌──────────┐  Ejecutar/Estado/Matar
-  │ Inicio │───▶│ Ejecutar │◀──────────────────────┐
-  └────────┘    └──────────┘───────────────────────┐│
-                   │    ▲                          ││
-          Suspender│    │Reasumir                  ││
-                   ▼    │                          ││
-                ┌─────────────┐   Parar     ┌──────┴┤
-                │ Suspendidos │───────────▶ │ Parar ││
-                └─────────────┘             └───────┘│
-                                  Procesos=0         │
-                                ┌───────────┐        │
-                                │ Terminar  │◀───────┘
-                                └───────────┘
-```
-
-#### Definición de un Proceso de Lotes
-
-Un proceso de lotes combina un programa con ficheros de entrada/salida:
-
-```json
-{
-  "id_programa": "p-0001",
-  "id_fichero_entrada": "f-0001",
-  "id_fichero_salida": "f-0002"
-}
-```
-
-El ejecutor:
-1. Lee el programa registrado con `id_programa` de `aralmac`.
-2. Lee el contenido del fichero de entrada (`id_fichero_entrada`) de `aralmac`.
-3. Crea un proceso hijo ejecutando el programa, pasando el contenido del fichero como entrada estándar (stdin).
-4. Captura la salida estándar (stdout) del proceso hijo.
-5. Escribe el resultado en el fichero de salida (`id_fichero_salida`) en `aralmac`.
-
-#### Operaciones — Mensajes JSON
-
-**Ejecutar proceso de lotes:**
-
-Petición:
-```json
-{
-  "id": "req-301",
-  "servicio": "ejecutor",
-  "operacion": "ejecutar",
-  "parametros": {
-    "lote": {
-      "id_programa": "p-0001",
-      "id_fichero_entrada": "f-0001",
-      "id_fichero_salida": "f-0002"
-    }
-  }
-}
-```
-
-Respuesta exitosa:
-```json
-{
-  "id": "req-301",
-  "estado": "ok",
-  "datos": { "id_lote": "l-0001" },
-  "mensaje": "Proceso de lotes iniciado."
-}
-```
-
-**Consultar estado de un lote:**
-
-Petición:
-```json
-{
-  "id": "req-302",
-  "servicio": "ejecutor",
-  "operacion": "estado",
-  "parametros": { "id_lote": "l-0001" }
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-302",
-  "estado": "ok",
-  "datos": {
-    "id_lote": "l-0001",
-    "estado_lote": "ejecutando | terminado | error",
-    "pid": 12345,
-    "codigo_salida": null
-  },
-  "mensaje": ""
-}
-```
-
-**Listar todos los procesos de lotes:**
-
-Petición:
-```json
-{
-  "id": "req-303",
-  "servicio": "ejecutor",
-  "operacion": "estado",
-  "parametros": {}
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-303",
-  "estado": "ok",
-  "datos": {
-    "lotes": [
-      { "id_lote": "l-0001", "estado_lote": "ejecutando", "id_programa": "p-0001" },
-      { "id_lote": "l-0002", "estado_lote": "terminado", "id_programa": "p-0003" }
-    ]
-  },
-  "mensaje": ""
-}
-```
-
-**Matar un proceso de lotes:**
-
-Petición:
-```json
-{
-  "id": "req-304",
-  "servicio": "ejecutor",
-  "operacion": "matar",
-  "parametros": { "id_lote": "l-0001" }
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-304",
-  "estado": "ok",
-  "datos": { "id_lote": "l-0001" },
-  "mensaje": "Proceso de lotes terminado forzosamente."
-}
-```
-
-**Suspender el ejecutor:**
-
-Petición:
-```json
-{
-  "id": "req-305",
-  "servicio": "ejecutor",
-  "operacion": "suspender",
-  "parametros": {}
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-305",
-  "estado": "ok",
-  "datos": { "estado_servicio": "suspendido" },
-  "mensaje": "Ejecutor suspendido."
-}
-```
-
-**Reasumir el ejecutor:**
-
-Petición:
-```json
-{
-  "id": "req-306",
-  "servicio": "ejecutor",
-  "operacion": "reasumir",
-  "parametros": {}
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-306",
-  "estado": "ok",
-  "datos": { "estado_servicio": "ejecutando" },
-  "mensaje": "Ejecutor reasumido."
-}
-```
-
-**Parar el ejecutor:**
-
-Petición:
-```json
-{
-  "id": "req-307",
-  "servicio": "ejecutor",
-  "operacion": "parar",
-  "parametros": {}
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-307",
-  "estado": "ok",
-  "datos": { "estado_servicio": "parando" },
-  "mensaje": "Ejecutor en estado Parar. Terminará cuando no queden procesos activos."
-}
-```
-
-**Terminar el ejecutor:**
-
-Petición:
-```json
-{
-  "id": "req-308",
-  "servicio": "ejecutor",
-  "operacion": "terminar",
-  "parametros": {}
-}
-```
-
-Respuesta:
-```json
-{
-  "id": "req-308",
-  "estado": "ok",
-  "datos": { "estado_servicio": "terminado" },
-  "mensaje": "Ejecutor terminado."
-}
-```
-
----
-
-## 5. Área de Almacenamiento (aralmac)
-
-### 5.1 Estructura de Directorios
-
-`aralmac` es un directorio en el sistema de archivos que funciona como almacenamiento persistente para ficheros y programas.
+El aralmac es un directorio en disco configurado con el argumento `-x`. Su estructura:
 
 ```
 aralmac/
 ├── ficheros/
-│   ├── f-0001          # contenido del fichero
+│   ├── f-0001          ← contenido real del fichero (texto plano)
 │   ├── f-0002
 │   └── ...
+├── ficheros_counter.json    ← {"next": 3}
 ├── programas/
-│   ├── p-0001.json     # metadatos del programa
+│   ├── p-0001.json     ← metadatos del programa
 │   ├── p-0002.json
 │   └── ...
-└── metadata/
-    ├── ficheros.json   # índice de ficheros (contadores, lista)
-    └── programas.json  # índice de programas (contadores, lista)
+├── programas_counter.json   ← {"next": 3}
+└── ejecuciones_counter.json ← {"next": 5}
 ```
 
-### 5.2 Formato de Metadatos de Programa
-
-Cada programa registrado se almacena como un archivo JSON:
-
+Cada `p-XXXX.json` contiene:
 ```json
 {
-  "id_programa": "p-0001",
-  "ejecutable": "/usr/bin/sort",
-  "argumentos": ["-r", "-n"],
-  "ambiente": {
-    "LANG": "es_CO.UTF-8",
-    "PATH": "/usr/bin:/bin"
-  },
-  "fecha_registro": "2026-05-03T10:30:00Z"
-}
-```
-
-### 5.3 Gestión de Identificadores
-
-Los identificadores siguen un esquema secuencial:
-
-- **Ficheros:** `f-XXXX` → `f-0001`, `f-0002`, ..., `f-9999`
-- **Programas:** `p-XXXX` → `p-0001`, `p-0002`, ..., `p-9999`
-- **Lotes:** `l-XXXX` → `l-0001`, `l-0002`, ..., `l-9999`
-
-El contador se almacena en los archivos de metadata y se incrementa en cada creación.
-
----
-
-## 6. Manejo de Errores
-
-### 6.1 Códigos de Error
-
-| Código | Descripción |
-|---|---|
-| `ERR_SERVICIO_DESCONOCIDO` | El campo `servicio` no corresponde a ningún servicio válido. |
-| `ERR_OPERACION_DESCONOCIDA` | La operación solicitada no existe para el servicio. |
-| `ERR_FICHERO_NO_ENCONTRADO` | El `id_fichero` no existe en aralmac. |
-| `ERR_PROGRAMA_NO_ENCONTRADO` | El `id_programa` no existe en aralmac. |
-| `ERR_LOTE_NO_ENCONTRADO` | El `id_lote` no existe. |
-| `ERR_EJECUTABLE_INVALIDO` | El ejecutable no existe o no tiene permisos. |
-| `ERR_RUTA_INVALIDA` | La ruta del fichero origen no es válida o no existe. |
-| `ERR_SERVICIO_SUSPENDIDO` | El servicio está suspendido y no acepta esa operación. |
-| `ERR_TRANSICION_INVALIDA` | La transición de estado solicitada no es válida. |
-| `ERR_PARAMETROS_INVALIDOS` | Faltan parámetros o tienen formato incorrecto. |
-| `ERR_EJECUCION_FALLIDA` | El proceso hijo no pudo iniciarse. |
-
-### 6.2 Formato de Respuesta de Error
-
-```json
-{
-  "id": "req-999",
-  "estado": "error",
-  "datos": {
-    "codigo": "ERR_FICHERO_NO_ENCONTRADO"
-  },
-  "mensaje": "El fichero con id 'f-9999' no existe en el almacenamiento."
+  "id-programa": "p-0001",
+  "nombre":      "sort",
+  "ejecutable":  "/usr/bin/sort",
+  "args":        ["-r", "-n"],
+  "env":         ["LANG=es_CO.UTF-8"]
 }
 ```
 
 ---
 
-## 7. Gestión de Procesos por Sistema Operativo
+## 5. Diseño por Componente
 
-### 7.1 Linux
+### 5.1 gesfich — Gestor de Ficheros
 
-| Acción | Llamada al sistema |
-|---|---|
-| Crear proceso | `fork()` + `execve()` |
-| Redirigir stdin | `dup2(fd_entrada, STDIN_FILENO)` |
-| Capturar stdout | `dup2(fd_salida, STDOUT_FILENO)` con `pipe()` |
-| Esperar proceso | `waitpid(pid, &status, WNOHANG)` |
-| Matar proceso | `kill(pid, SIGKILL)` |
-| Suspender proceso | `kill(pid, SIGSTOP)` |
-| Reanudar proceso | `kill(pid, SIGCONT)` |
+**Máquina de estados:**
+```
+inicio → Corriendo ──Suspender──▶ Suspendido
+                   ◀──Reasumir──
+         Corriendo  ──Terminar──▶ Terminado
+         Suspendido ──Terminar──▶ Terminado
+```
 
-### 7.2 Windows 11
+**En estado Suspendido**: solo acepta `Reasumir` y `Terminar`. Todas las operaciones CRUD devuelven `{"estado":"error","mensaje":"servicio suspendido"}`.
 
-| Acción | API Win32 |
-|---|---|
-| Crear proceso | `CreateProcess()` con `STARTUPINFO` |
-| Redirigir stdin | `STARTUPINFO.hStdInput` con `CreatePipe()` |
-| Capturar stdout | `STARTUPINFO.hStdOutput` con `CreatePipe()` |
-| Esperar proceso | `WaitForSingleObject(hProcess, 0)` |
-| Matar proceso | `TerminateProcess(hProcess, 1)` |
-| Suspender proceso | `SuspendThread(hThread)` |
-| Reanudar proceso | `ResumeThread(hThread)` |
+**Operaciones y respuestas del protocolo:** ver sección 3.9 del enunciado.
+
+### 5.2 gesprog — Gestor de Programas
+
+**Máquina de estados:** idéntica a gesfich.
+
+**Diferencia clave vs gesfich**: en estado `Suspendido`, gesprog **sí permite** la operación `Leer`. Esto está explícito en el diagrama del enunciado (figura 4): la flecha "Leer" sale desde el estado `Suspendido`. Las demás operaciones CRUD (Guardar, Actualizar, Borrar) sí quedan bloqueadas.
+
+**Motivo**: un administrador que suspende gesprog todavía puede necesitar consultar qué programas están registrados (para decidir cuál lanzar), aunque no quiera que se registren nuevos.
+
+### 5.3 ejecutor — Ejecutor de Procesos
+
+**Máquina de estados del servicio:**
+```
+inicio → Ejecutar ──Suspender──▶ Suspendidos ──Reasumir──▶ Ejecutar
+         Ejecutar  ──Parar──────▶ Parar
+         Suspendidos ──Parar───▶ Parar
+         Parar ──(procesos=0)──▶ Terminado
+```
+
+**Ejecución de un proceso de lotes:**
+
+1. Leer metadatos del programa desde `aralmac/programas/p-XXXX.json` (acceso directo al disco, sin pasar por gesprog)
+2. Abrir ficheros de I/O en `aralmac/ficheros/f-XXXX` si se especificaron
+3. Lanzar el proceso con `subprocess.Popen` (hace `fork+exec` internamente en Linux)
+4. Registrar el proceso en el diccionario `procesos`
+5. Lanzar un **hilo monitor** que llama a `popen.wait()` de forma bloqueante
+
+**Por qué un hilo monitor por proceso:**
+`popen.wait()` es bloqueante. Si se llamara en el hilo principal, el servicio quedaría congelado sin poder atender nuevas peticiones mientras el proceso de lotes corre. Con un hilo separado, el hilo principal queda libre. Se usa `threading.Thread` (no `multiprocessing`) porque:
+- Los procesos son I/O-bound (esperan en pipes), no CPU-bound
+- El hilo monitor necesita modificar el diccionario compartido `procesos`, lo que con `threading` no requiere serialización
+- `threading` es más simple y con menos overhead para esta tarea
+
+**Gestión de señales a procesos hijo:**
+- Matar: `popen.kill()` → SIGKILL
+- Suspender todos (Suspendidos): `os.kill(pid, signal.SIGSTOP)`
+- Reasumir todos: `os.kill(pid, signal.SIGCONT)`
+
+**Estado `Parar`**: el servicio deja de aceptar nuevas ejecuciones y espera a que todos los procesos activos terminen. La transición a `Terminado` la hace el **hilo monitor** del último proceso en terminar, no el hilo principal.
+
+**Por qué `estado_servicio_ref` es una lista y no un string:**
+Los strings en Python son inmutables. Si el hilo monitor necesita cambiar el estado a `Terminado`, necesita una referencia mutable. Una lista de un elemento `[estado]` permite que varios hilos lean y modifiquen el estado sin cambiar la referencia al objeto.
+
+### 5.4 ctrllt — Controlador de Lotes
+
+**Máquina de estados:** `Corriendo → Terminado`
+
+**Lógica de enrutamiento:**
+```
+recibir(peticion)
+├── peticion["servicio"] == "gesfich"  → escribir a pipe_fich_req, leer de pipe_fich_res
+├── peticion["servicio"] == "gesprog"  → escribir a pipe_prog_req, leer de pipe_prog_res
+├── peticion["servicio"] == "ejecutor" → escribir a pipe_ejec_req, leer de pipe_ejec_res
+├── peticion["servicio"] == "ctrllt"   → manejar localmente (solo "Terminar")
+└── otro servicio                      → retornar {"estado":"error","mensaje":"servicio desconocido"}
+```
+
+**Procesamiento secuencial**: ctrllt procesa una petición a la vez. Después de reenviar al servicio, espera la respuesta antes de aceptar la siguiente petición. Esto garantiza que cada respuesta corresponde exactamente a la petición enviada.
+
+**Conflicto de argumentos `-c`**: el enunciado usa `-c` tanto para la pipe del cliente como para la pipe de respuesta de gesprog. En esta implementación se usa `--gres` para la pipe de respuesta de gesprog para evitar el conflicto en `argparse`.
+
+**Operación Terminar del sistema:**
+1. Envía `{"servicio":"gesfich","operacion":"Terminar"}` a gesfich y espera confirmación
+2. Envía `{"servicio":"gesprog","operacion":"Terminar"}` a gesprog y espera confirmación
+3. Envía `{"servicio":"ejecutor","operacion":"Parar"}` al ejecutor (que terminará solo cuando no queden procesos activos)
+4. Envía `{"estado":"ok"}` al cliente
+5. Sale del bucle principal
 
 ---
 
-## 8. Invocación de los Componentes
+## 6. Instrucciones de Arranque
 
-### 8.1 Ejemplo de Arranque del Sistema (Linux)
+### Paso 1: Crear el aralmac
 
 ```bash
-# 1. Crear directorio de almacenamiento
-mkdir -p /tmp/aralmac/ficheros /tmp/aralmac/programas /tmp/aralmac/metadata
-
-# 2. Iniciar servicios (cada uno en una terminal o en background)
-./gesfich -f /tmp/ejlotes_fich_req -b /tmp/ejlotes_fich_res -x /tmp/aralmac &
-./gesprog -p /tmp/ejlotes_prog_req -c /tmp/ejlotes_prog_res -x /tmp/aralmac &
-./ejecutor -e /tmp/ejlotes_ejec_req -d /tmp/ejlotes_ejec_res -x /tmp/aralmac &
-
-# 3. Iniciar controlador de lotes
-./ctrllt -c /tmp/ejlotes_cli_req -a /tmp/ejlotes_cli_res \
-         -f /tmp/ejlotes_fich_req -b /tmp/ejlotes_fich_res \
-         -p /tmp/ejlotes_prog_req -c /tmp/ejlotes_prog_res \
-         -e /tmp/ejlotes_ejec_req -d /tmp/ejlotes_ejec_res &
-
-# 4. Ejecutar cliente
-./cliente -c /tmp/ejlotes_cli_req -a /tmp/ejlotes_cli_res
+mkdir -p /tmp/aralmac/ficheros /tmp/aralmac/programas
 ```
 
-### 8.2 Ejemplo de Arranque del Sistema (Windows)
+### Paso 2: Lanzar los servicios (en terminales separadas o en background)
 
-```powershell
-# 1. Crear directorio de almacenamiento
-mkdir C:\aralmac\ficheros
-mkdir C:\aralmac\programas
-mkdir C:\aralmac\metadata
+```bash
+# Terminal 1
+python3 src/gesfich.py -f /tmp/ejlotes_fich_req -b /tmp/ejlotes_fich_res -x /tmp/aralmac
 
-# 2. Iniciar servicios
-Start-Process .\gesfich.exe -ArgumentList "-f \\.\pipe\ejlotes_fich -x C:\aralmac"
-Start-Process .\gesprog.exe -ArgumentList "-p \\.\pipe\ejlotes_prog -x C:\aralmac"
-Start-Process .\ejecutor.exe -ArgumentList "-e \\.\pipe\ejlotes_ejec -x C:\aralmac"
+# Terminal 2
+python3 src/gesprog.py -p /tmp/ejlotes_prog_req -c /tmp/ejlotes_prog_res -x /tmp/aralmac
 
-# 3. Iniciar controlador
-Start-Process .\ctrllt.exe -ArgumentList "-c \\.\pipe\ejlotes_cli -f \\.\pipe\ejlotes_fich -p \\.\pipe\ejlotes_prog -e \\.\pipe\ejlotes_ejec"
+# Terminal 3
+python3 src/ejecutor.py -e /tmp/ejlotes_ejec_req -d /tmp/ejlotes_ejec_res -x /tmp/aralmac
 
-# 4. Ejecutar cliente
-.\cliente.exe -c \\.\pipe\ejlotes_cli
+# Terminal 4
+python3 src/ctrllt.py \
+  -c /tmp/ejlotes_cli_req  -a /tmp/ejlotes_cli_res \
+  -f /tmp/ejlotes_fich_req -b /tmp/ejlotes_fich_res \
+  -p /tmp/ejlotes_prog_req --gres /tmp/ejlotes_prog_res \
+  -e /tmp/ejlotes_ejec_req -d /tmp/ejlotes_ejec_res
+```
+
+### Paso 3: Conectar el cliente (cuando lo provea el profesor)
+
+```bash
+cliente -c /tmp/ejlotes_cli_req -a /tmp/ejlotes_cli_res
 ```
 
 ---
 
-## 9. Ejemplo de Flujo Completo
-
-A continuación se ilustra un escenario completo de ejecución de un proceso de lotes:
-
-### Paso 1: Crear un fichero de entrada
+## 7. Ejemplo de Flujo Completo
 
 ```
-cliente → ctrllt → gesfich
-```
+1. Cliente → ctrllt: {"servicio":"gesfich","operacion":"Crear"}
+   ctrllt  → gesfich: (mismo mensaje)
+   gesfich → ctrllt:  {"estado":"ok","id-fichero":"f-0001"}
+   ctrllt  → cliente: (misma respuesta)
 
-```json
-{ "id": "r1", "servicio": "gesfich", "operacion": "crear", "parametros": {} }
-```
-Respuesta: `{ "datos": { "id_fichero": "f-0001" } }`
+2. Cliente → ctrllt: {"servicio":"gesfich","operacion":"Actualizar","id-fichero":"f-0001","ruta":"/home/user/datos.txt"}
+   ... gesfich copia el contenido ...
+   Respuesta: {"estado":"ok"}
 
-### Paso 2: Cargar datos al fichero de entrada
+3. Cliente → ctrllt: {"servicio":"gesprog","operacion":"Guardar","ejecutable":"/usr/bin/sort","args":["-r"]}
+   ... gesprog guarda p-0001.json ...
+   Respuesta: {"estado":"ok","id-programa":"p-0001"}
 
-```json
-{
-  "id": "r2", "servicio": "gesfich", "operacion": "actualizar",
-  "parametros": { "id_fichero": "f-0001", "ruta_fichero": "/home/user/datos.txt" }
-}
-```
+4. Cliente → ctrllt: {"servicio":"ejecutor","operacion":"Ejecutar","id-programa":"p-0001","stdin":"f-0001","stdout":"f-0002"}
+   ... ejecutor lanza sort con f-0001 como stdin, escribe resultado en f-0002 ...
+   Respuesta: {"estado":"ok","id-ejecucion":"e-0001"}
 
-### Paso 3: Crear un fichero de salida
+5. Cliente → ctrllt: {"servicio":"ejecutor","operacion":"Estado","id-ejecucion":"e-0001"}
+   Respuesta: {"estado":"ok","id-ejecucion":"e-0001","id-programa":"p-0001","proceso-estado":"Terminado","codigo-salida":0}
 
-```json
-{ "id": "r3", "servicio": "gesfich", "operacion": "crear", "parametros": {} }
-```
-Respuesta: `{ "datos": { "id_fichero": "f-0002" } }`
-
-### Paso 4: Registrar el programa
-
-```json
-{
-  "id": "r4", "servicio": "gesprog", "operacion": "guardar",
-  "parametros": {
-    "ejecutable": "/usr/bin/sort",
-    "argumentos": ["-r", "-n"],
-    "ambiente": { "LANG": "es_CO.UTF-8" }
-  }
-}
-```
-Respuesta: `{ "datos": { "id_programa": "p-0001" } }`
-
-### Paso 5: Ejecutar el proceso de lotes
-
-```json
-{
-  "id": "r5", "servicio": "ejecutor", "operacion": "ejecutar",
-  "parametros": {
-    "lote": {
-      "id_programa": "p-0001",
-      "id_fichero_entrada": "f-0001",
-      "id_fichero_salida": "f-0002"
-    }
-  }
-}
-```
-Respuesta: `{ "datos": { "id_lote": "l-0001" } }`
-
-### Paso 6: Consultar estado
-
-```json
-{ "id": "r6", "servicio": "ejecutor", "operacion": "estado", "parametros": { "id_lote": "l-0001" } }
-```
-
-### Paso 7: Leer resultado
-
-```json
-{ "id": "r7", "servicio": "gesfich", "operacion": "leer", "parametros": { "id_fichero": "f-0002" } }
+6. Cliente → ctrllt: {"servicio":"gesfich","operacion":"Leer","id-fichero":"f-0002"}
+   Respuesta: {"estado":"ok","contenido":"<datos ordenados>"}
 ```
 
 ---
 
-## 10. Tecnologías y Herramientas
+## 8. Decisiones de Diseño
 
-| Aspecto | Decisión |
-|---|---|
-| Lenguaje | C (para acceso directo a llamadas del sistema) |
-| Compilador Linux | GCC |
-| Compilador Windows | MSVC o MinGW-w64 |
-| Formato de mensajes | JSON |
-| Librería JSON (C) | cJSON (ligera, dominio público) |
-| Sistema de build | Makefile (Linux), CMake (multiplataforma) |
-| Control de versiones | Git (GitHub/GitLab) |
-| Documentación | Markdown |
-
----
-
-## 11. Estructura del Repositorio
-
-```
-proyecto-ejecutor-lotes/
-├── docs/
-│   └── Diseño.md                 # Este documento
-├── src/
-│   ├── common/
-│   │   ├── protocolo.h           # Estructuras y funciones de serialización JSON
-│   │   ├── protocolo.c
-│   │   ├── tuberias.h            # Abstracción de tuberías (Linux/Windows)
-│   │   └── tuberias.c
-│   ├── ctrllt/
-│   │   ├── ctrllt.c
-│   │   └── ctrllt.h
-│   ├── gesfich/
-│   │   ├── gesfich.c
-│   │   └── gesfich.h
-│   ├── gesprog/
-│   │   ├── gesprog.c
-│   │   └── gesprog.h
-│   ├── ejecutor/
-│   │   ├── ejecutor.c
-│   │   └── ejecutor.h
-│   └── cliente/
-│       └── (proporcionado por el profesor)
-├── lib/
-│   └── cjson/                    # Librería cJSON
-├── Makefile                      # Build Linux
-├── CMakeLists.txt                # Build multiplataforma
-└── README.md
-```
-
----
-
-## 12. Plan de Implementación
-
-| Fase | Descripción | Prioridad |
+| Decisión | Alternativa descartada | Razón de la elección |
 |---|---|---|
-| 1 | Módulo común: protocolo JSON + abstracción de tuberías | Alta |
-| 2 | gesfich: CRUD de ficheros + máquina de estados | Alta |
-| 3 | gesprog: CRUD de programas + máquina de estados | Alta |
-| 4 | ejecutor: creación y gestión de procesos hijo | Alta |
-| 5 | ctrllt: enrutamiento + concurrencia multicliente | Alta |
-| 6 | Integración y pruebas end-to-end | Alta |
-| 7 | Portabilidad Windows (si aplica) | Media |
+| `threading` para el monitor de procesos | `multiprocessing` | Los procesos son I/O-bound; el estado compartido (diccionario `procesos`) es más simple con threads que con colas de mensajes entre procesos |
+| Apertura con `O_RDWR` | Apertura con `O_RDONLY`/`O_WRONLY` | Evita interbloqueo en el arranque; los servicios pueden iniciarse en cualquier orden |
+| Lectura byte a byte | `readline()` en modo texto | Control explícito sobre el buffer; `readline()` sobre un fd POSIX puede tener comportamientos inesperados; con byte a byte el flujo es claro |
+| Archivos JSON planos en aralmac | Base de datos SQLite | Más simple, legible, no requiere librerías externas; el enunciado dice que `<info-aralmac>` puede ser "la ruta de un directorio" |
+| Procesamiento secuencial en ctrllt | Hilo por petición | Evita mezcla de respuestas en las pipes de los servicios; los servicios son secuenciales de todas formas |
+| `subprocess.Popen` para lanzar procesos | `os.fork()` + `os.execve()` | `Popen` maneja los detalles de `fork+exec` correctamente (cierre de fds, señales, etc.); `os.fork()` en Python puede tener problemas con hilos activos |
+| `daemon=True` en los hilos monitor | Hilos no-daemon | Permite que Python salga limpiamente sin esperar a que los hilos monitor terminen cuando el servicio principal recibe SIGTERM |
+
+---
+
+## 9. Estructura del Repositorio
+
+```
+/
+├── docs/
+│   └── diseño.md          ← este documento
+├── src/
+│   ├── ctrllt.py          ← pasarela central
+│   ├── gesfich.py         ← gestor de ficheros
+│   ├── gesprog.py         ← gestor de programas
+│   └── ejecutor.py        ← ejecutor de procesos de lotes
+├── tests/
+│   └── prueba_manual.sh   ← script de prueba con echo + pipes
+├── README.md
+└── .gitignore
+```
